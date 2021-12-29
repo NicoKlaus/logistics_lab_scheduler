@@ -1,5 +1,6 @@
 import os
 import math
+import random
 
 import functools as ft
 
@@ -26,6 +27,20 @@ def rate_schedule(vehicles):
     return ret
 
 
+def compute_remaining_demand(demand):
+    remaining_demand = 0
+    for dem in demand:
+        remaining_demand = remaining_demand + dem.count
+    return remaining_demand
+
+
+def compute_min_cost(demand):
+    cost = 0.0
+    for dem in demand:
+        cost = cost + dem.count * dem.distance
+    return cost
+
+
 class Demand:
     def __init__(self, start, end, count, path_distance):
         self.start = start
@@ -50,18 +65,20 @@ class Job:
 
 
 class Vehicle:
-    def __init__(self, position, places):
+    def __init__(self, start_place, places):
         self.places = places  # reference to a mapping of place id -> position
-        self.position = position
+        self.position = places[start_place]
         self.traveled_distance = 0.0
         self.path = []  # traveled path (start,end)
         self.jobs = []  # assigned jobs (Job objects)
         self.cargo = 0
+        self.node = start_place
 
     def add_job(self, destination, load, unload, distance_to_cover):
         self.jobs.append(Job(destination, load, unload))
         self.traveled_distance = self.traveled_distance + distance_to_cover
         self.position = self.places[destination]
+        self.node = destination
 
     def fuse_jobs(self):
         job_list = []
@@ -79,7 +96,7 @@ class Vehicle:
         self.jobs = job_list
 
     def copy(self):
-        ret = Vehicle(self.position, self.places)
+        ret = Vehicle(self.node, self.places)
         ret.jobs = self.jobs.copy()
         ret.path = self.path.copy()
         ret.traveled_distance = self.traveled_distance
@@ -98,6 +115,14 @@ class TransportRoutes:
         fn = open(node_file, "r")
         self.places = read_node_file(fn)
         fn.close()
+
+        # find the longest straight line between two places
+        max_diameter = 0.0
+        for x in self.places.values():
+            for y in self.places.values():
+                max_diameter = max(max_diameter, distance(x, y))
+        self.map_diameter = max_diameter
+        self.termination_request = False
 
     def read_demand_file(self, f):
         lines = f.readlines()
@@ -118,6 +143,9 @@ class TransportRoutes:
 
     def cost_to_fulfill(self, start_position, job: Demand):
         return distance(start_position, self.places[job.start]) + job.distance
+
+    def upper_bound(self, remaining_demand, offset):
+        return offset + (2 * remaining_demand) * self.map_diameter
 
     """
     finds a schedule for each vehicle using a greedy optimization tactic
@@ -147,7 +175,7 @@ class TransportRoutes:
     def greedy_paths(self, num_vehicles):
         """ create demand objects with precomputed path lengths"""
         demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand)}
-        vehicles = {identifier: Vehicle(self.places[identifier], self.places) for identifier in
+        vehicles = {identifier: Vehicle(identifier, self.places) for identifier in
                     range(1, num_vehicles + 1)}
         ret = self.continue_greedy_paths(demand, vehicles)
         """fuse jobs, validation fails without this"""
@@ -156,66 +184,59 @@ class TransportRoutes:
         return ret
 
     """
-    finds the optimal schedule by using a global optimization method
+    finds the optimal schedule by using a global optimization method, use this for one vehicle only, 
+    this gets way to complex for more vehicles
     """
 
-    def branch_and_bound(self, num_vehicles, initial_bound=float('inf')):
+    def branch_and_bound(self, num_vehicles, initial_bound=float('inf'), exploration_limit=-1):
         """what is the upper bound of a given incomplete schedule?"""
         # 1. find the longest path and take it times the remaining jobs, guranteed to be equal or worse than the worst
 
         """are there other schedules to exclude?"""
         # always pick something up if possible, ignore schedules not doing this
 
-        # find the longest straight line between two places
-        max_diameter = 0.0
-        for x in self.places.values():
-            for y in self.places.values():
-                max_diameter = max(max_diameter, distance(x, y))
-
         """ this represents one state of the computation and will be stored as permuted copy again in the branch steps"""
-        demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand)}
-        vehicles = {identifier: Vehicle(self.places[identifier], self.places) for identifier in
+        demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand) if
+                  d[2] > 0}
+        vehicles = {identifier: Vehicle(identifier, self.places) for identifier in
                     range(1, num_vehicles + 1)}
 
-        queue = [(demand, vehicles)]  # it is important to handle vehicles as if they were immutable objects, TODO may add score here
+        first_bound = compute_min_cost(demand.values())
+        # demand, vehicles, score, lower bound
+        queue = [(demand, vehicles, 0.0, first_bound)]
 
         best_schedule = (None, float('inf'))  # contains a map of vehicle objects and a score for the schedule
         bound = initial_bound  # this will be update while searching schedules
 
         progress = 0
-        passed_branch = 0
         completed_schedules = 0
+        passed_branch = 0
+        bound_changed = True
 
-        while len(queue) > 0:
-            state = queue.pop(0)
+        pop_index = -1  # -1 for dfs, 0 for bfs
+
+        bfs_to_dfs_ratio = 0.00
+        min_lower_bound = compute_min_cost(demand.values()) / num_vehicles
+        last_passed_lower_bound = initial_bound
+        last_bound_change = 0
+        allways_try_non_local_demand = False
+
+        while len(queue) > 0 and not self.termination_request:
+            progress = progress + 1
+            current_demand, current_vehicles, score, _ = queue.pop(pop_index)
             """ bound , cut branches violating the boundaries """
-            # TODO move bound step in loop of branch step to avoid creating many useless nodes in BFS mode
-            # rate schedule
-            remaining_demand = 0
-            for dem in state[0].values():
-                remaining_demand = remaining_demand + dem.count
-            score = rate_schedule(state[1].values())  # best case == score
-
-            # check if schedule is still in bounds
+            # check if schedule is still in bounds (may changed because of an update)
             if score > bound:
                 continue
 
-            # update boundaries
-            bound = min(bound, score + (2 * remaining_demand) * max_diameter)  # worst case
-            passed_branch = passed_branch + 1
-
-            # finished?
-            if remaining_demand == 0:
-                completed_schedules = completed_schedules + 1
-                if score < best_schedule[1]:
-                    best_schedule = (state[1], score)
-                    continue
-
             """ branch , generate new tree nodes"""
             # find jobs suitable for the vehicles and create new states
-            for demand_id, demand_value in state[0].items():
-
-                for vehicle_id, vehicle in state[1].items():
+            for vehicle_id, vehicle in current_vehicles.items():
+                local_demand = [(k, d) for k, d in current_demand.items() if d.start == vehicle.node]
+                accepted_demand_1 = local_demand if len(local_demand) > 0 else current_demand.items()
+                accepted_demand = [x for x in accepted_demand_1]
+                random.shuffle(accepted_demand)
+                for demand_id, demand_value in accepted_demand:
 
                     if demand_value.count > 0:
                         """add that job to the vehicles tasks and deal with these data object if they where immutable"""
@@ -225,7 +246,7 @@ class TransportRoutes:
                         new_vehicle.add_job(demand_value.end, False, True, demand_value.distance)
 
                         # create new states
-                        new_demand = state[0].copy()
+                        new_demand = current_demand.copy()
                         """add updated demand to new state"""
                         new_dem_count = demand_value.count - 1
                         if new_dem_count <= 0:
@@ -234,25 +255,91 @@ class TransportRoutes:
                             d = demand_value.copy()
                             d.count = new_dem_count
                             new_demand[demand_id] = d
+                            assert (new_demand[demand_id].count > 0)
                         """replace old vehicle object"""
-                        new_schedule = state[1].copy()
+                        new_schedule = current_vehicles.copy()
                         new_schedule[vehicle_id] = new_vehicle
-                        new_state = (new_demand, new_schedule)
+                        new_score = rate_schedule(new_schedule.values())  # best case == score
+                        lower_bound = (new_score + compute_min_cost(new_demand.values())) / num_vehicles
+                        if len(local_demand) == 0:
+                            lower_bound = lower_bound + min([self.place_distance(new_vehicle.node, v.start) for k, v in accepted_demand])
+                        """ bound step for generated items"""
+                        remaining_demand = compute_remaining_demand(new_demand.values())
+
+                        if lower_bound >= bound:
+                            continue
+                        passed_branch = passed_branch + 1
+                        last_passed_lower_bound = lower_bound
+
+                        # update boundaries
+                        # new_bound = self.upper_bound(remaining_demand, new_score)
+                        # new_bound = new_score + 2 * compute_min_cost(new_demand.values()) + self.cost_to_fulfill(
+                        #    new_vehicle.position, demand_value)
+                        # if new_bound < bound:
+                        #    bound = new_bound
+                        #    annealing_bound = new_bound
+                        #    bound_changed = True
+
+                        # finished?
+                        if remaining_demand == 0:
+                            completed_schedules = completed_schedules + 1
+                            artificial_annealing = True  # activate annealing
+                            if new_score < best_schedule[1]:
+                                best_schedule = (new_schedule, new_score)
+                                bound = new_score
+                                bound_changed = True
+                                last_bound_change = progress
+                            continue
 
                         # add to queue
+                        new_state = (new_demand, new_schedule, new_score, lower_bound)
                         queue.append(new_state)
+                    else:
+                        print("found demand with count 0")
 
-                # console output during computation
-                progress = progress+1
-                if progress > 100000:
-                    print(f"queue size: {len(queue)} bound: {bound} passed branch: {passed_branch/1000.0}% complete: {completed_schedules}    ", end="\r")
-                    progress = 0
-                    passed_branch = 0
+            #if len(queue) > 100000:
+            #    if passed_branch > 900 and completed_schedules > 0:
+            #        passed_branch = 0
+                    # if random.randint(0, 1000) > 999:
+                    #    random.shuffle(queue)
+                    # annealing step
+                    # if artificial_annealing:
+                    #    annealing_bound = max(min_lower_bound+self.map_diameter, annealing_bound * 0.99)
+            # console output during computation
+            if progress % 100000 == 0 or bound_changed:
+                print(
+                    f"mode: {'bfs' if pop_index == 0 else 'dfs'} queue size: {len(queue)} bound: {bound} complete: {completed_schedules} last accepted lower bound/min bound: {last_passed_lower_bound}/{min_lower_bound}    ",
+                    end="\r")
+                if bound_changed:
+                    queue = [(d, c, s, lb) for (d, c, s, lb) in queue if lb < bound]
+                    bound_changed = False
+                c = random.randint(0, 20)
+                if c == 0:
+                    random.shuffle(queue)
+                #elif c == 1:
+                #    queue.sort(key=lambda x: x[3], reverse=True)
+
+            if bfs_to_dfs_ratio > 0.0:
+                progress_limit = max(10000, int(2000 * math.log(len(queue) + 1, 10)))
+                progress_limit = int(bfs_to_dfs_ratio * progress_limit if pop_index == 0 else progress_limit)
+                if progress % progress_limit == 0:
+                    if completed_schedules > 0:
+                        pop_index = 0 if pop_index == -1 else -1
+                    else:
+                        pop_index = -1
+            if exploration_limit > 0 and progress-last_bound_change > exploration_limit:
+                self.terminate()
+                print("terminating due to exploration limit hit")
+
         """fuse jobs, validation fails without this"""
-        for vi in best_schedule[0]:
-            best_schedule[0][vi].fuse_jobs()  # this combines unload and load jobs on the same machine
+        if best_schedule[0] is not None:
+            for vi in best_schedule[0]:
+                best_schedule[0][vi].fuse_jobs()  # this combines unload and load jobs on the same machine
         """ return the results """
         return best_schedule[0]
+
+    def terminate(self):
+        self.termination_request = True
 
 
 def main():
@@ -260,10 +347,10 @@ def main():
     routes = TransportRoutes("transport_demand.txt", "nodes.csv")
     # print(routes.demand)
     # print(routes.places)
-    vehicles = routes.greedy_paths(num_vehicles)
-    # greedy_schedule = routes.greedy_paths(num_vehicles)
-    # vehicles = routes.branch_and_bound(num_vehicles, rate_schedule(greedy_schedule.values()))
-    # vehicles = routes.branch_and_bound(num_vehicles)
+    # vehicles = routes.greedy_paths(num_vehicles)
+    greedy_schedule = routes.greedy_paths(num_vehicles)
+    vehicles = routes.branch_and_bound(num_vehicles, initial_bound=rate_schedule(greedy_schedule.values())+1.0, exploration_limit=100000000)
+    #vehicles = routes.branch_and_bound(num_vehicles, 7193.8964)
 
     fo = open("schedule.txt", "w")
     fo.write("VehicleId;Location;unload;load\n")
