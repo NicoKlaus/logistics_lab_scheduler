@@ -69,10 +69,9 @@ class Vehicle:
         self.places = places  # reference to a mapping of place id -> position
         self.position = places[start_place]
         self.traveled_distance = 0.0
-        self.path = []  # traveled path (start,end)
         self.jobs = []  # assigned jobs (Job objects)
-        self.cargo = 0
         self.node = start_place
+        self.start = start_place
 
     def add_job(self, destination, load, unload, distance_to_cover):
         self.jobs.append(Job(destination, load, unload))
@@ -98,10 +97,108 @@ class Vehicle:
     def copy(self):
         ret = Vehicle(self.node, self.places)
         ret.jobs = self.jobs.copy()
-        ret.path = self.path.copy()
         ret.traveled_distance = self.traveled_distance
-        ret.cargo = self.cargo
         return ret
+
+    def recompute_path(self):
+        self.node = self.start
+        self.position = self.places[self.node]
+        self.traveled_distance = 0.0
+        jobs = self.jobs
+        self.jobs = []
+        for j in jobs:
+            self.add_job(j.destination, j.load, j.unload, distance(self.position, self.places[j.destination]))
+
+
+def two_opt_move(vehicles, i):
+    """ swaps two neighboring demands, this only works fine with unfused jobs"""
+    vehicle = vehicles[i]
+    for selection in range(0, len(vehicle.jobs) - 4, 2):
+        new_schedule = vehicle.copy()
+        """ served demand = one load + one unload job"""
+        # swap load jobs
+        new_schedule.jobs[selection], new_schedule.jobs[selection + 2] = new_schedule.jobs[selection + 2], \
+                                                                         new_schedule.jobs[selection]
+        # swap unload jobs
+        new_schedule.jobs[selection + 1], new_schedule.jobs[selection + 3] = new_schedule.jobs[selection + 3], \
+                                                                             new_schedule.jobs[selection + 1]
+        new_schedule.recompute_path()
+        if new_schedule.traveled_distance < vehicle.traveled_distance:  # may use cost function for route
+            vehicle = new_schedule
+    vehicles[i] = vehicle
+    return True
+
+
+def insertion_move(vehicles):
+    """ this only works with unfused jobs"""
+    # is this inter route?
+    target_vi = random.choice(list(vehicles.keys()))
+    vehicle = vehicles[target_vi].copy()
+    while len(vehicle.jobs) == 0:
+        target_vi = random.choice(list(vehicles.keys()))
+        vehicle = vehicles[target_vi].copy()
+
+    source_i = random.randint(0, len(vehicle.jobs) - 1) & ~1
+
+    tmp_load = vehicle.jobs.pop(source_i)
+    tmp_unload = vehicle.jobs.pop(source_i)
+
+    # this computation happens later because source and target are allowed to be the same
+    target_j = random.randint(0, len(vehicle.jobs)) & ~1
+    vehicle.jobs.insert(target_j, tmp_unload)
+    vehicle.jobs.insert(target_j, tmp_load)
+    vehicle.recompute_path()
+    vehicles[target_vi] = vehicle
+    return True
+
+
+def swap_shift_move(vehicles):
+    if len(vehicles) <= 1:
+        return False
+    vl = list(vehicles.keys())
+    source_vi = vl.pop(random.randint(0, len(vl) - 1))
+    target_vi = vl.pop(random.randint(0, len(vl) - 1))
+    op = random.randint(0, 1)  # 0: shift, 1: swap
+
+    source_v = vehicles[source_vi].copy()
+    target_v = vehicles[target_vi].copy()
+    if op == 0 and len(source_v.jobs) > 0:  # shift
+        source_i = random.randint(0, len(source_v.jobs) - 1) & ~1
+        tmp_load = source_v.jobs.pop(source_i)
+        tmp_unload = source_v.jobs.pop(source_i)
+
+        target_j = random.randint(0, len(target_v.jobs)) & ~1
+        target_v.jobs.insert(target_j, tmp_unload)
+        target_v.jobs.insert(target_j, tmp_load)
+    else:  # swap
+        while len(target_v.jobs) == 0:
+            if len(vl) == 0:
+                return False
+            target_vi = vl.pop(random.randint(0, len(vl) - 1))
+            target_v = vehicles[target_vi].copy()
+        while len(source_v.jobs) == 0:
+            if len(vl) == 0:
+                return False
+            source_vi = vl.pop(random.randint(0, len(vl) - 1))
+            source_v = vehicles[source_vi].copy()
+
+        source_i = random.randint(0, len(source_v.jobs) - 1) & ~1
+        target_j = random.randint(0, len(target_v.jobs) - 1) & ~1
+        source_v.jobs[source_i], target_v.jobs[target_j] = target_v.jobs[target_j], source_v.jobs[source_i]
+        source_v.jobs[source_i + 1], target_v.jobs[target_j + 1] = target_v.jobs[target_j + 1], source_v.jobs[source_i + 1]
+    # write back
+    source_v.recompute_path()
+    target_v.recompute_path()
+    vehicles[source_vi] = source_v
+    vehicles[target_vi] = target_v
+    return True
+
+
+def total_distance(vehicles):
+    s = 0.0
+    for v in vehicles:
+        s = s + v.traveled_distance
+    return s
 
 
 class TransportRoutes:
@@ -172,15 +269,16 @@ class TransportRoutes:
         #     vehicles[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
         return vehicles
 
-    def greedy_paths(self, num_vehicles):
+    def greedy_paths(self, num_vehicles, fuse_jobs=True):
         """ create demand objects with precomputed path lengths"""
         demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand)}
         vehicles = {identifier: Vehicle(identifier, self.places) for identifier in
                     range(1, num_vehicles + 1)}
         ret = self.continue_greedy_paths(demand, vehicles)
         """fuse jobs, validation fails without this"""
-        for vi in ret:
-            ret[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
+        if fuse_jobs:
+            for vi in ret:
+                ret[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
         return ret
 
     """
@@ -188,12 +286,8 @@ class TransportRoutes:
     this gets way to complex for more vehicles
     """
 
-    def branch_and_bound(self, num_vehicles, initial_bound=float('inf'), exploration_limit=-1):
-        """what is the upper bound of a given incomplete schedule?"""
-        # 1. find the longest path and take it times the remaining jobs, guranteed to be equal or worse than the worst
-
-        """are there other schedules to exclude?"""
-        # always pick something up if possible, ignore schedules not doing this
+    def branch_and_bound(self, initial_bound=float('inf'), exploration_limit=-1):
+        num_vehicles = 1
 
         """ this represents one state of the computation and will be stored as permuted copy again in the branch steps"""
         demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand) if
@@ -233,7 +327,8 @@ class TransportRoutes:
             # find jobs suitable for the vehicles and create new states
             for vehicle_id, vehicle in current_vehicles.items():
                 local_demand = [(k, d) for k, d in current_demand.items() if d.start == vehicle.node]
-                accepted_demand_1 = local_demand if len(local_demand) > 0 else current_demand.items()
+                # accepted_demand_1 = local_demand if len(local_demand) > 0 else current_demand.items()
+                accepted_demand_1 = current_demand.items()
                 accepted_demand = [x for x in accepted_demand_1]
                 random.shuffle(accepted_demand)
                 for demand_id, demand_value in accepted_demand:
@@ -262,7 +357,8 @@ class TransportRoutes:
                         new_score = rate_schedule(new_schedule.values())  # best case == score
                         lower_bound = (new_score + compute_min_cost(new_demand.values())) / num_vehicles
                         if len(local_demand) == 0:
-                            lower_bound = lower_bound + min([self.place_distance(new_vehicle.node, v.start) for k, v in accepted_demand])
+                            lower_bound = lower_bound + min(
+                                [self.place_distance(new_vehicle.node, v.start) for k, v in accepted_demand])
                         """ bound step for generated items"""
                         remaining_demand = compute_remaining_demand(new_demand.values())
 
@@ -297,14 +393,14 @@ class TransportRoutes:
                     else:
                         print("found demand with count 0")
 
-            #if len(queue) > 100000:
+            # if len(queue) > 100000:
             #    if passed_branch > 900 and completed_schedules > 0:
             #        passed_branch = 0
-                    # if random.randint(0, 1000) > 999:
-                    #    random.shuffle(queue)
-                    # annealing step
-                    # if artificial_annealing:
-                    #    annealing_bound = max(min_lower_bound+self.map_diameter, annealing_bound * 0.99)
+            # if random.randint(0, 1000) > 999:
+            #    random.shuffle(queue)
+            # annealing step
+            # if artificial_annealing:
+            #    annealing_bound = max(min_lower_bound+self.map_diameter, annealing_bound * 0.99)
             # console output during computation
             if progress % 100000 == 0 or bound_changed:
                 print(
@@ -316,7 +412,7 @@ class TransportRoutes:
                 c = random.randint(0, 20)
                 if c == 0:
                     random.shuffle(queue)
-                #elif c == 1:
+                # elif c == 1:
                 #    queue.sort(key=lambda x: x[3], reverse=True)
 
             if bfs_to_dfs_ratio > 0.0:
@@ -327,7 +423,7 @@ class TransportRoutes:
                         pop_index = 0 if pop_index == -1 else -1
                     else:
                         pop_index = -1
-            if exploration_limit > 0 and progress-last_bound_change > exploration_limit:
+            if exploration_limit > 0 and progress - last_bound_change > exploration_limit:
                 self.terminate()
                 print("terminating due to exploration limit hit")
 
@@ -337,6 +433,86 @@ class TransportRoutes:
                 best_schedule[0][vi].fuse_jobs()  # this combines unload and load jobs on the same machine
         """ return the results """
         return best_schedule[0]
+
+    def simulated_annealing(self, initial_schedules):
+        """idea from Wang et al. - 2013 - Simulated Annealing for a Vehicle Routing Problem"""
+
+        """parameters"""
+        gamma = 1.0
+        sigma = 1.0
+        beta = 0.997  # annealing step
+        omega = 2500  # max iterations without improvement
+
+        L = 30 #  max iterations for the same temperature
+
+        """ this represents one state of the computation and will be stored as permuted copy again in the branch steps"""
+        demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand) if
+                  d[2] > 0}
+        vehicles = initial_schedules
+
+        """ begins from an initial schedule as solution"""
+        num_vehicles = len(initial_schedules)
+
+        routes_total_travel_distance = compute_min_cost(demand.values())
+
+        # cost = rate_schedule(vehicles)+sigma*(num_vehicles*len(self.places))
+        cost = rate_schedule(vehicles.values())
+        temp = cost
+
+        progress = 0
+        iteration = 0
+        last_temp = temp
+
+        score = rate_schedule(vehicles.values())
+
+        best_solution = initial_schedules
+        best_solution_score = score
+
+        while iteration < omega:
+
+            # inner loop
+            for i in range(0, L):
+                """modify solution"""
+                new_solution = vehicles.copy()
+                # demand_workset = demand.copy()
+                sum_demand = ft.reduce(lambda x, dem: x + dem.count, demand.values(), 0)
+
+                success = False
+                while not success:
+                    op = random.randint(0, 2)
+                    if op == 0:
+                        success = two_opt_move(new_solution, random.choice(list(new_solution.keys())))
+                    elif op == 1:
+                        success = insertion_move(new_solution)
+                    elif op == 2:
+                        success = swap_shift_move(new_solution)
+
+                new_score = rate_schedule(new_solution.values())
+
+                """accept solution"""
+                if new_score < score or random.random() <= math.exp((score - new_score) / temp):
+                    vehicles = new_solution
+                    score = new_score
+                    if new_score < best_solution_score:
+                        best_solution = vehicles
+                        best_solution_score = new_score
+                        iteration = 0  # reset iteration counter to indicate a change
+
+                progress = progress + 1
+                if progress % 100 == 0:
+                    print(f"temp: {temp} score: {score} best score: {best_solution_score}                ", end="\r")
+
+            """annealing step"""
+            temp = beta * temp
+
+            """update iteration counter"""
+            iteration = iteration + 1
+            last_temp = temp
+        """fuse jobs, validation fails without this"""
+        for vi in best_solution:
+            best_solution[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
+        print(f"temp: {temp} score: {score} best score: {best_solution_score}")
+        return best_solution
 
     def terminate(self):
         self.termination_request = True
@@ -348,9 +524,16 @@ def main():
     # print(routes.demand)
     # print(routes.places)
     # vehicles = routes.greedy_paths(num_vehicles)
-    greedy_schedule = routes.greedy_paths(num_vehicles)
-    vehicles = routes.branch_and_bound(num_vehicles, initial_bound=rate_schedule(greedy_schedule.values())+1.0, exploration_limit=100000000)
-    #vehicles = routes.branch_and_bound(num_vehicles, 7193.8964)
+    # greedy_schedule = routes.greedy_paths(num_vehicles)
+    # vehicles = routes.branch_and_bound(num_vehicles, initial_bound=rate_schedule(greedy_schedule.values())+1.0, exploration_limit=100000000)
+    # vehicles = routes.branch_and_bound(7193.8964)
+    vehicles = routes.greedy_paths(num_vehicles, fuse_jobs=False)
+    vehicles = routes.simulated_annealing(vehicles)
+
+    # for v in vehicles:
+    #     vehicles[v].recompute_path()
+
+    print(f"score: {rate_schedule(vehicles.values())}")
 
     fo = open("schedule.txt", "w")
     fo.write("VehicleId;Location;unload;load\n")
