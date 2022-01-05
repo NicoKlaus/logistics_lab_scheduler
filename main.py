@@ -98,6 +98,8 @@ class Vehicle:
         ret = Vehicle(self.node, self.places)
         ret.jobs = self.jobs.copy()
         ret.traveled_distance = self.traveled_distance
+        ret.position = self.position
+        ret.start = self.start
         return ret
 
     def recompute_path(self):
@@ -109,6 +111,17 @@ class Vehicle:
         for j in jobs:
             self.add_job(j.destination, j.load, j.unload, distance(self.position, self.places[j.destination]))
 
+    def fix_start_point(self):
+        """adds an empty job to the beginning of the job list if the first jobs location != start"""
+        if len(self.jobs) > 0 and self.jobs[0].load and self.jobs[0].destination != self.start:
+            self.jobs.insert(0, Job(self.start, False, False))
+
+
+def finalize_schedule(vehicles):
+    """fuse jobs and add start points, validation fails without this"""
+    for vi in vehicles:
+        vehicles[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
+        vehicles[vi].fix_start_point()
 
 def two_opt_move(vehicles, i):
     """ swaps two neighboring demands, this only works fine with unfused jobs"""
@@ -269,16 +282,17 @@ class TransportRoutes:
         #     vehicles[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
         return vehicles
 
-    def greedy_paths(self, num_vehicles, fuse_jobs=True):
+    def greedy_paths(self, num_vehicles):
         """ create demand objects with precomputed path lengths"""
         demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand)}
         vehicles = {identifier: Vehicle(identifier, self.places) for identifier in
                     range(1, num_vehicles + 1)}
+
+        # lowest possible for comparison
+        min_lower_bound = compute_min_cost(demand.values()) / num_vehicles
+        print(f"lower bound for the solution: {min_lower_bound}")
+
         ret = self.continue_greedy_paths(demand, vehicles)
-        """fuse jobs, validation fails without this"""
-        if fuse_jobs:
-            for vi in ret:
-                ret[vi].fuse_jobs()  # this combines unload and load jobs on the same machine
         return ret
 
     """
@@ -440,10 +454,9 @@ class TransportRoutes:
         """parameters"""
         gamma = 1.0
         sigma = 1.0
-        beta = 0.997  # annealing step
-        omega = 2500  # max iterations without improvement
-
-        L = 30 #  max iterations for the same temperature
+        beta = 0.99  # annealing step (default: 0.97)
+        omega = 5000  # max iterations without improvement (default: 250)
+        L = 1000 #  max iterations for the same temperature (default: 30)
 
         """ this represents one state of the computation and will be stored as permuted copy again in the branch steps"""
         demand = {di: Demand(d[0], d[1], d[2], self.place_distance(d[0], d[1])) for di, d in enumerate(self.demand) if
@@ -455,15 +468,15 @@ class TransportRoutes:
 
         routes_total_travel_distance = compute_min_cost(demand.values())
 
+        score = rate_schedule(vehicles.values())
+
         # cost = rate_schedule(vehicles)+sigma*(num_vehicles*len(self.places))
-        cost = rate_schedule(vehicles.values())
+        cost = score
         temp = cost
 
         progress = 0
         iteration = 0
         last_temp = temp
-
-        score = rate_schedule(vehicles.values())
 
         best_solution = initial_schedules
         best_solution_score = score
@@ -519,17 +532,18 @@ class TransportRoutes:
 
 
 def main():
-    num_vehicles = 1
+    num_vehicles = 5
     routes = TransportRoutes("transport_demand.txt", "nodes.csv")
+
     # print(routes.demand)
     # print(routes.places)
     # vehicles = routes.greedy_paths(num_vehicles)
     # greedy_schedule = routes.greedy_paths(num_vehicles)
     # vehicles = routes.branch_and_bound(num_vehicles, initial_bound=rate_schedule(greedy_schedule.values())+1.0, exploration_limit=100000000)
     # vehicles = routes.branch_and_bound(7193.8964)
-    vehicles = routes.greedy_paths(num_vehicles, fuse_jobs=False)
+    vehicles = routes.greedy_paths(num_vehicles)
     vehicles = routes.simulated_annealing(vehicles)
-
+    finalize_schedule(vehicles)
     # for v in vehicles:
     #     vehicles[v].recompute_path()
 
